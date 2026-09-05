@@ -2,13 +2,13 @@
 // Licensed under the Apache-2.0 and MIT licenses.
 #![doc = include_str!("../README.md")]
 
-use std::{fmt, time::Duration, convert::{From, TryFrom}, path::Path, fs::File, io::Read};
-use num_enum::TryFromPrimitive;
+use bitvec::field::BitField;
+use bitvec::vec::BitVec;
 use indicatif::{ProgressBar, ProgressStyle};
-use jtagdap::jtag::{IDCODE, JTAGTAP, JTAGChain, Error as JTAGError};
-use jtagdap::bitvec::{self, bytes_to_bits, bits_to_bytes, Error as BitvecError};
-
-pub use jtagdap;
+use num_enum::TryFromPrimitive;
+use probe_rs::config::ScanChainElement;
+use probe_rs::probe::{DebugProbeError, JtagAccess, JtagSequence};
+use std::{convert::TryFrom, fmt, fs::File, io::Read, path::Path, time::Duration};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -25,10 +25,8 @@ pub enum Error {
     RemoveIdcodeNoMetadata,
     #[error("SPI Flash error")]
     SPIFlash(#[from] spi_flash::Error),
-    #[error("JTAG error")]
-    JTAG(#[from] JTAGError),
-    #[error("Bitvec error")]
-    Bitvec(#[from] BitvecError),
+    #[error("JTAG probe error")]
+    Probe(#[from] DebugProbeError),
     #[error("I/O error")]
     IO(#[from] std::io::Error),
     #[error(transparent)]
@@ -43,169 +41,152 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Note first byte is the revision which may vary and so is 0 here.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, TryFromPrimitive)]
-#[allow(non_camel_case_types)]
 #[repr(u32)]
-pub enum X7IDCODE {
-    X7S6        = 0x03622093,
-    X7S15       = 0x03620093,
-    X7S25       = 0x037C4093,
-    X7S50       = 0x0362F093,
-    X7S75       = 0x037C8093,
-    X7S100      = 0x037c7093,
-    X7A12T      = 0x037c3093,
-    X7A15T      = 0x0362E093,
-    X7A25T      = 0x037C2093,
-    X7A35T      = 0x0362D093,
-    X7A50T      = 0x0362C093,
-    X7A75T      = 0x03632093,
-    X7A100T     = 0x03631093,
-    X7A200T     = 0x03636093,
-    X7K70T      = 0x03647093,
-    X7K160T     = 0x0364C093,
-    X7K325T     = 0x03651093,
-    X7K355T     = 0x03747093,
-    X7K410T     = 0x03656093,
-    X7K420T     = 0x03752093,
-    X7K480T     = 0x03751093,
-    X7V575T     = 0x03671093,
-    X7VX330T    = 0x03667093,
-    X7VX415T    = 0x03682093,
-    X7VX485T    = 0x03687093,
-    X7VX550T    = 0x03692093,
-    X7VX690T    = 0x03691093,
-    X7VX980T    = 0x03696093,
-    X7VX1140T   = 0x036D5093,
-    X7VH580T    = 0x036D9093,
-    X7VH870T    = 0x036DB093,
-    X7Z007S     = 0x03723093,
-    X7Z012S     = 0x0373c093,
-    X7Z014S     = 0x03728093,
-    X7Z010      = 0x03722093,
-    X7Z015      = 0x0373b093,
-    X7Z020      = 0x03727093,
-    X7Z030      = 0x0372c093,
-    X7Z035      = 0x03732093,
-    X7Z045      = 0x03731093,
-    X7Z100      = 0x03736093,
+pub enum X7IdCode {
+    X7S6 = 0x03622093,
+    X7S15 = 0x03620093,
+    X7S25 = 0x037C4093,
+    X7S50 = 0x0362F093,
+    X7S75 = 0x037C8093,
+    X7S100 = 0x037c7093,
+    X7A12T = 0x037c3093,
+    X7A15T = 0x0362E093,
+    X7A25T = 0x037C2093,
+    X7A35T = 0x0362D093,
+    X7A50T = 0x0362C093,
+    X7A75T = 0x03632093,
+    X7A100T = 0x03631093,
+    X7A200T = 0x03636093,
+    X7K70T = 0x03647093,
+    X7K160T = 0x0364C093,
+    X7K325T = 0x03651093,
+    X7K355T = 0x03747093,
+    X7K410T = 0x03656093,
+    X7K420T = 0x03752093,
+    X7K480T = 0x03751093,
+    X7V575T = 0x03671093,
+    X7VX330T = 0x03667093,
+    X7VX415T = 0x03682093,
+    X7VX485T = 0x03687093,
+    X7VX550T = 0x03692093,
+    X7VX690T = 0x03691093,
+    X7VX980T = 0x03696093,
+    X7VX1140T = 0x036D5093,
+    X7VH580T = 0x036D9093,
+    X7VH870T = 0x036DB093,
+    X7Z007S = 0x03723093,
+    X7Z012S = 0x0373c093,
+    X7Z014S = 0x03728093,
+    X7Z010 = 0x03722093,
+    X7Z015 = 0x0373b093,
+    X7Z020 = 0x03727093,
+    X7Z030 = 0x0372c093,
+    X7Z035 = 0x03732093,
+    X7Z045 = 0x03731093,
+    X7Z100 = 0x03736093,
 }
 
-impl From<X7IDCODE> for IDCODE {
-    fn from(id: X7IDCODE) -> IDCODE {
-        IDCODE(id as u32)
-    }
-}
-
-impl From<&X7IDCODE> for IDCODE {
-    fn from(id: &X7IDCODE) -> IDCODE {
-        IDCODE(*id as u32)
-    }
-}
-
-impl X7IDCODE {
-    pub fn try_from_idcode(idcode: IDCODE) -> Option<Self> {
-        Self::try_from(idcode.0 & 0x0FFF_FFFF).ok()
-    }
-
+impl X7IdCode {
     pub fn try_from_u32(idcode: u32) -> Option<Self> {
-        Self::try_from_idcode(IDCODE(idcode))
+        Self::try_from(idcode & 0x0FFF_FFFF).ok()
     }
 
     pub fn try_from_name(name: &str) -> Option<Self> {
         match name.to_ascii_uppercase().as_str() {
-            "X7S6" => Some(X7IDCODE::X7S6),
-            "X7S15" => Some(X7IDCODE::X7S15),
-            "X7S25" => Some(X7IDCODE::X7S25),
-            "X7S50" => Some(X7IDCODE::X7S50),
-            "X7S75" => Some(X7IDCODE::X7S75),
-            "X7S100" => Some(X7IDCODE::X7S100),
-            "X7A12T" => Some(X7IDCODE::X7A12T),
-            "X7A15T" => Some(X7IDCODE::X7A15T),
-            "X7A25T" => Some(X7IDCODE::X7A25T),
-            "X7A35T" => Some(X7IDCODE::X7A35T),
-            "X7A50T" => Some(X7IDCODE::X7A50T),
-            "X7A75T" => Some(X7IDCODE::X7A75T),
-            "X7A100T" => Some(X7IDCODE::X7A100T),
-            "X7A200T" => Some(X7IDCODE::X7A200T),
-            "X7K70T" => Some(X7IDCODE::X7K70T),
-            "X7K160T" => Some(X7IDCODE::X7K160T),
-            "X7K325T" => Some(X7IDCODE::X7K325T),
-            "X7K355T" => Some(X7IDCODE::X7K355T),
-            "X7K410T" => Some(X7IDCODE::X7K410T),
-            "X7K420T" => Some(X7IDCODE::X7K420T),
-            "X7K480T" => Some(X7IDCODE::X7K480T),
-            "X7V575T" => Some(X7IDCODE::X7V575T),
-            "X7VX330T" => Some(X7IDCODE::X7VX330T),
-            "X7VX415T" => Some(X7IDCODE::X7VX415T),
-            "X7VX485T" => Some(X7IDCODE::X7VX485T),
-            "X7VX550T" => Some(X7IDCODE::X7VX550T),
-            "X7VX690T" => Some(X7IDCODE::X7VX690T),
-            "X7VX980T" => Some(X7IDCODE::X7VX980T),
-            "X7VX1140T" => Some(X7IDCODE::X7VX1140T),
-            "X7VH580T" => Some(X7IDCODE::X7VH580T),
-            "X7VH870T" => Some(X7IDCODE::X7VH870T),
-            "X7Z007S" => Some(X7IDCODE::X7Z007S),
-            "X7Z012S" => Some(X7IDCODE::X7Z012S),
-            "X7Z014S" => Some(X7IDCODE::X7Z014S),
-            "X7Z010" => Some(X7IDCODE::X7Z010),
-            "X7Z015" => Some(X7IDCODE::X7Z015),
-            "X7Z020" => Some(X7IDCODE::X7Z020),
-            "X7Z030" => Some(X7IDCODE::X7Z030),
-            "X7Z035" => Some(X7IDCODE::X7Z035),
-            "X7Z045" => Some(X7IDCODE::X7Z045),
-            "X7Z100" => Some(X7IDCODE::X7Z100),
+            "X7S6" => Some(X7IdCode::X7S6),
+            "X7S15" => Some(X7IdCode::X7S15),
+            "X7S25" => Some(X7IdCode::X7S25),
+            "X7S50" => Some(X7IdCode::X7S50),
+            "X7S75" => Some(X7IdCode::X7S75),
+            "X7S100" => Some(X7IdCode::X7S100),
+            "X7A12T" => Some(X7IdCode::X7A12T),
+            "X7A15T" => Some(X7IdCode::X7A15T),
+            "X7A25T" => Some(X7IdCode::X7A25T),
+            "X7A35T" => Some(X7IdCode::X7A35T),
+            "X7A50T" => Some(X7IdCode::X7A50T),
+            "X7A75T" => Some(X7IdCode::X7A75T),
+            "X7A100T" => Some(X7IdCode::X7A100T),
+            "X7A200T" => Some(X7IdCode::X7A200T),
+            "X7K70T" => Some(X7IdCode::X7K70T),
+            "X7K160T" => Some(X7IdCode::X7K160T),
+            "X7K325T" => Some(X7IdCode::X7K325T),
+            "X7K355T" => Some(X7IdCode::X7K355T),
+            "X7K410T" => Some(X7IdCode::X7K410T),
+            "X7K420T" => Some(X7IdCode::X7K420T),
+            "X7K480T" => Some(X7IdCode::X7K480T),
+            "X7V575T" => Some(X7IdCode::X7V575T),
+            "X7VX330T" => Some(X7IdCode::X7VX330T),
+            "X7VX415T" => Some(X7IdCode::X7VX415T),
+            "X7VX485T" => Some(X7IdCode::X7VX485T),
+            "X7VX550T" => Some(X7IdCode::X7VX550T),
+            "X7VX690T" => Some(X7IdCode::X7VX690T),
+            "X7VX980T" => Some(X7IdCode::X7VX980T),
+            "X7VX1140T" => Some(X7IdCode::X7VX1140T),
+            "X7VH580T" => Some(X7IdCode::X7VH580T),
+            "X7VH870T" => Some(X7IdCode::X7VH870T),
+            "X7Z007S" => Some(X7IdCode::X7Z007S),
+            "X7Z012S" => Some(X7IdCode::X7Z012S),
+            "X7Z014S" => Some(X7IdCode::X7Z014S),
+            "X7Z010" => Some(X7IdCode::X7Z010),
+            "X7Z015" => Some(X7IdCode::X7Z015),
+            "X7Z020" => Some(X7IdCode::X7Z020),
+            "X7Z030" => Some(X7IdCode::X7Z030),
+            "X7Z035" => Some(X7IdCode::X7Z035),
+            "X7Z045" => Some(X7IdCode::X7Z045),
+            "X7Z100" => Some(X7IdCode::X7Z100),
             _ => None,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            X7IDCODE::X7S6 => "X7S6",
-            X7IDCODE::X7S15 => "X7S15",
-            X7IDCODE::X7S25 => "X7S25",
-            X7IDCODE::X7S50 => "X7S50",
-            X7IDCODE::X7S75 => "X7S75",
-            X7IDCODE::X7S100 => "X7S100",
-            X7IDCODE::X7A12T => "X7A12T",
-            X7IDCODE::X7A15T => "X7A15T",
-            X7IDCODE::X7A25T => "X7A25T",
-            X7IDCODE::X7A35T => "X7A35T",
-            X7IDCODE::X7A50T => "X7A50T",
-            X7IDCODE::X7A75T => "X7A75T",
-            X7IDCODE::X7A100T => "X7A100T",
-            X7IDCODE::X7A200T => "X7A200T",
-            X7IDCODE::X7K70T => "X7K70T",
-            X7IDCODE::X7K160T => "X7K160T",
-            X7IDCODE::X7K325T => "X7K325T",
-            X7IDCODE::X7K355T => "X7K355T",
-            X7IDCODE::X7K410T => "X7K410T",
-            X7IDCODE::X7K420T => "X7K420T",
-            X7IDCODE::X7K480T => "X7K480T",
-            X7IDCODE::X7V575T => "X7V575T",
-            X7IDCODE::X7VX330T => "X7VX330T",
-            X7IDCODE::X7VX415T => "X7VX415T",
-            X7IDCODE::X7VX485T => "X7VX485T",
-            X7IDCODE::X7VX550T => "X7VX550T",
-            X7IDCODE::X7VX690T => "X7VX690T",
-            X7IDCODE::X7VX980T => "X7VX980T",
-            X7IDCODE::X7VX1140T => "X7VX1140T",
-            X7IDCODE::X7VH580T => "X7VH580T",
-            X7IDCODE::X7VH870T => "X7VH870T",
-            X7IDCODE::X7Z007S => "X7Z007S",
-            X7IDCODE::X7Z012S => "X7Z012S",
-            X7IDCODE::X7Z014S => "X7Z014S",
-            X7IDCODE::X7Z010 => "X7Z010",
-            X7IDCODE::X7Z015 => "X7Z015",
-            X7IDCODE::X7Z020 => "X7Z020",
-            X7IDCODE::X7Z030 => "X7Z030",
-            X7IDCODE::X7Z035 => "X7Z035",
-            X7IDCODE::X7Z045 => "X7Z045",
-            X7IDCODE::X7Z100 => "X7Z100",
+            X7IdCode::X7S6 => "X7S6",
+            X7IdCode::X7S15 => "X7S15",
+            X7IdCode::X7S25 => "X7S25",
+            X7IdCode::X7S50 => "X7S50",
+            X7IdCode::X7S75 => "X7S75",
+            X7IdCode::X7S100 => "X7S100",
+            X7IdCode::X7A12T => "X7A12T",
+            X7IdCode::X7A15T => "X7A15T",
+            X7IdCode::X7A25T => "X7A25T",
+            X7IdCode::X7A35T => "X7A35T",
+            X7IdCode::X7A50T => "X7A50T",
+            X7IdCode::X7A75T => "X7A75T",
+            X7IdCode::X7A100T => "X7A100T",
+            X7IdCode::X7A200T => "X7A200T",
+            X7IdCode::X7K70T => "X7K70T",
+            X7IdCode::X7K160T => "X7K160T",
+            X7IdCode::X7K325T => "X7K325T",
+            X7IdCode::X7K355T => "X7K355T",
+            X7IdCode::X7K410T => "X7K410T",
+            X7IdCode::X7K420T => "X7K420T",
+            X7IdCode::X7K480T => "X7K480T",
+            X7IdCode::X7V575T => "X7V575T",
+            X7IdCode::X7VX330T => "X7VX330T",
+            X7IdCode::X7VX415T => "X7VX415T",
+            X7IdCode::X7VX485T => "X7VX485T",
+            X7IdCode::X7VX550T => "X7VX550T",
+            X7IdCode::X7VX690T => "X7VX690T",
+            X7IdCode::X7VX980T => "X7VX980T",
+            X7IdCode::X7VX1140T => "X7VX1140T",
+            X7IdCode::X7VH580T => "X7VH580T",
+            X7IdCode::X7VH870T => "X7VH870T",
+            X7IdCode::X7Z007S => "X7Z007S",
+            X7IdCode::X7Z012S => "X7Z012S",
+            X7IdCode::X7Z014S => "X7Z014S",
+            X7IdCode::X7Z010 => "X7Z010",
+            X7IdCode::X7Z015 => "X7Z015",
+            X7IdCode::X7Z020 => "X7Z020",
+            X7IdCode::X7Z030 => "X7Z030",
+            X7IdCode::X7Z035 => "X7Z035",
+            X7IdCode::X7Z045 => "X7Z045",
+            X7IdCode::X7Z100 => "X7Z100",
         }
     }
 
     /// Returns whether the provided IDCODE is considered compatible with
     /// this IDCODE.
-    pub fn compatible(&self, other: X7IDCODE) -> bool {
+    pub fn compatible(&self, other: X7IdCode) -> bool {
         *self == other
     }
 
@@ -217,81 +198,154 @@ impl X7IDCODE {
     }
 
     pub fn is_zynq7000(&self) -> bool {
-        match *self {
-            X7IDCODE::X7Z007S | X7IDCODE::X7Z012S | X7IDCODE::X7Z014S | X7IDCODE::X7Z010 |
-            X7IDCODE::X7Z015  | X7IDCODE::X7Z020  | X7IDCODE::X7Z030  | X7IDCODE::X7Z035 |
-            X7IDCODE::X7Z045  | X7IDCODE::X7Z100 => true,
-            _ => false,
-        }
+        matches!(
+            *self,
+            X7IdCode::X7Z007S
+                | X7IdCode::X7Z012S
+                | X7IdCode::X7Z014S
+                | X7IdCode::X7Z010
+                | X7IdCode::X7Z015
+                | X7IdCode::X7Z020
+                | X7IdCode::X7Z030
+                | X7IdCode::X7Z035
+                | X7IdCode::X7Z045
+                | X7IdCode::X7Z100
+        )
     }
 }
 
-pub fn check_tap_idx(chain: &JTAGChain, index: usize) -> Option<X7IDCODE> {
-    match chain.idcodes().iter().nth(index) {
-        Some(Some(idcode)) => X7IDCODE::try_from_idcode(*idcode),
-        _ => None,
-    }
+/// Recover the raw 32-bit IDCODE from a scan chain element's name.
+///
+/// `JtagAccess::scan_chain()` only reports IDCODEs as a display string of the
+/// form "0x03727093" or "0x03727093 (Xilinx)", not as the underlying u32, so
+/// this parses that fixed prefix back out.
+pub fn idcode_from_scan_chain_name(name: &str) -> Option<u32> {
+    let hex = name.strip_prefix("0x")?.get(..8)?;
+    u32::from_str_radix(hex, 16).ok()
 }
 
-/// Attempt to discover a unique TAP index for a 7-series device in a JTAGChain.
-pub fn auto_tap_idx(chain: &JTAGChain) -> Option<(usize, X7IDCODE)> {
-    let x7_idxs: Vec<(usize, X7IDCODE)> = chain
-        .idcodes()
+pub fn check_tap_idx(chain: &[ScanChainElement], index: usize) -> Option<X7IdCode> {
+    let name = chain.get(index)?.name.as_deref()?;
+    X7IdCode::try_from_u32(idcode_from_scan_chain_name(name)?)
+}
+
+/// The PL's IR length on a Zynq-7000 two-TAP chain, per probe-rs's `Zynq7000.yaml`.
+const ZYNQ_PL_IR_LEN: u8 = 6;
+/// The PS (ARM DAP) IR length on a Zynq-7000 two-TAP chain, per probe-rs's `Zynq7000.yaml`.
+const ZYNQ_PS_IR_LEN: u8 = 4;
+
+/// Index of the PL TAP on a Zynq-7000's own two-TAP chain. Fixed by the chip's internal JTAG
+/// daisy-chain, not something that varies per board or probe.
+const ZYNQ_PL_TAP_IDX: usize = 0;
+
+/// Correct a mis-detected PL/PS IR length split on a Zynq-7000 scan chain.
+///
+/// Zynq-7000 always exposes two TAPs on one physical chain: a 6-bit PL
+/// (the 7-series configuration TAP this crate talks to) and a 4-bit PS
+/// (the ARM DAP). `JtagAccess::scan_chain()`'s generic IR length detection
+/// finds exactly two candidate boundaries for this shape, so it does not
+/// report an ambiguous chain, but it has no way to know which boundary
+/// belongs to which TAP and can attribute the two lengths backward.
+///
+/// Call this only once a Zynq-7000 is actually confirmed present (e.g. via a resolved
+/// `X7IdCode::is_zynq7000`) - it assumes rather than checks the chain shape. Returns `None`
+/// if `chain` isn't a two-element chain or the lengths are already correct.
+pub fn fixup_zynq_ir_lengths(chain: &[ScanChainElement]) -> Option<Vec<ScanChainElement>> {
+    if chain.len() != 2 {
+        return None;
+    }
+    let ps_idx = 1 - ZYNQ_PL_TAP_IDX;
+    if chain[ZYNQ_PL_TAP_IDX].ir_len() == ZYNQ_PL_IR_LEN && chain[ps_idx].ir_len() == ZYNQ_PS_IR_LEN
+    {
+        return None;
+    }
+    let mut fixed = chain.to_vec();
+    fixed[ZYNQ_PL_TAP_IDX].ir_len = Some(ZYNQ_PL_IR_LEN);
+    fixed[ps_idx].ir_len = Some(ZYNQ_PS_IR_LEN);
+    Some(fixed)
+}
+
+/// Attempt to discover a unique TAP index for a 7-series device in a scan chain.
+///
+/// This only looks at each TAP's IDCODE (`elem.name`), never at `elem.ir_len`,
+/// so it is unaffected by IR length mis-detection: it either finds the TAP or
+/// it doesn't, regardless of whether the recorded IR length for that TAP is
+/// correct (see `fixup_zynq_ir_lengths` for the IR length problem itself).
+pub fn auto_tap_idx(chain: &[ScanChainElement]) -> Option<(usize, X7IdCode)> {
+    let x7_idxs: Vec<(usize, X7IdCode)> = chain
         .iter()
         .enumerate()
-        .filter_map(|(idx, id)| id.map(|id| (idx, id)))
-        .filter_map(|(idx, id)| X7IDCODE::try_from_idcode(id).map(|id| (idx, id)))
+        .filter_map(|(idx, elem)| {
+            let Some(name) = elem.name.as_deref() else {
+                log::trace!("TAP {idx}: in BYPASS (no IDCODE), skipping");
+                return None;
+            };
+            let Some(idcode) = idcode_from_scan_chain_name(name) else {
+                log::trace!("TAP {idx}: could not parse an IDCODE out of {name:?}, skipping");
+                return None;
+            };
+            match X7IdCode::try_from_u32(idcode) {
+                Some(id) => {
+                    log::debug!("TAP {idx}: IDCODE 0x{idcode:08X} matches {}", id.name());
+                    Some((idx, id))
+                }
+                None => {
+                    log::trace!("TAP {idx}: IDCODE 0x{idcode:08X} is not a known 7-series part");
+                    None
+                }
+            }
+        })
         .collect();
     let len = x7_idxs.len();
     if len == 0 {
         log::info!("No 7-series device found in JTAG chain");
         None
     } else if len > 1 {
-        log::info!("Multiple 7-series devices found in JTAG chain, specify one using --tap");
+        let indices: Vec<usize> = x7_idxs.iter().map(|(idx, _)| *idx).collect();
+        log::info!(
+            "Multiple 7-series devices found in JTAG chain at TAPs {indices:?}, specify one using --tap"
+        );
         None
     } else {
         let (index, idcode) = x7_idxs.first().unwrap();
-        log::debug!("Automatically selecting device at TAP {}", index);
+        log::debug!(
+            "Automatically selecting device at TAP {index} ({})",
+            idcode.name()
+        );
         Some((*index, *idcode))
     }
 }
 
 /// 7-series JTAG instructions.
 #[derive(Copy, Clone, Debug)]
-#[allow(unused, non_camel_case_types, clippy::upper_case_acronyms)]
+#[allow(unused)]
 #[repr(u8)]
-enum Command {
-    EXTEST = 0b100110,
-    EXTEST_PULSE = 0b111100,
-    EXTEST_TRAIN = 0b1111101,
-    SAMPLE = 0b000001,
-    USER1 = 0b000010,
-    USER2 = 0b000011,
-    USER3 = 0b100010,
-    USER4 = 0b100011,
-    CFG_OUT = 0b000100,
-    CFG_IN = 0b000101,
-    USERCODE = 0b001000,
-    IDCODE = 0b001001,
-    HIGHZ_IO = 0b001010,
-    JPROGRAM = 0b001011,
-    JSTART = 0b001100,
-    JSHUTDOWN = 0b001101,
-    XADC_DRP = 0b110111,
-    ISC_ENABLE = 0b010000,
-    ISC_PROGRAM = 0b010001,
-    XSC_PROGRAM_KEY = 0b010010,
-    XSC_DNA = 0b010111,
-    FUSE_DNA = 0b110010,
-    ISC_NOOP = 0b010100,
-    ISC_DISABLE = 0b010110,
-    BYPASS = 0b111111,
-}
-
-impl Command {
-    pub fn bits(&self) -> Vec<bool> {
-        jtagdap::bitvec::bytes_to_bits(&[*self as u8], 6).unwrap()
-    }
+pub enum Command {
+    Extest = 0b100110,
+    ExtestPulse = 0b111100,
+    ExtestTrain = 0b1111101,
+    Sample = 0b000001,
+    User1 = 0b000010,
+    User2 = 0b000011,
+    User3 = 0b100010,
+    User4 = 0b100011,
+    CfgOut = 0b000100,
+    CfgIn = 0b000101,
+    UserCode = 0b001000,
+    IdCode = 0b001001,
+    HighZIo = 0b001010,
+    JProgram = 0b001011,
+    JStart = 0b001100,
+    JShutdown = 0b001101,
+    XadcDrp = 0b110111,
+    IscEnable = 0b010000,
+    IscProgram = 0b010001,
+    XscProgramKey = 0b010010,
+    XscDna = 0b010111,
+    FuseDna = 0b110010,
+    IscNoop = 0b010100,
+    IscDisable = 0b010110,
+    Bypass = 0b111111,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -358,18 +412,18 @@ pub struct MinMaxNow {
 impl MinMaxNow {
     pub fn from_temperature(min: u16, max: u16, current: u16) -> Self {
         Self {
-            min: ((min >> 4) as f32 * 503.975)/4096.0 - 273.15,
-            max: ((max >> 4) as f32 * 503.975)/4096.0 - 273.15,
-            current: ((current >> 4) as f32 * 503.975)/4096.0 - 273.15,
+            min: ((min >> 4) as f32 * 503.975) / 4096.0 - 273.15,
+            max: ((max >> 4) as f32 * 503.975) / 4096.0 - 273.15,
+            current: ((current >> 4) as f32 * 503.975) / 4096.0 - 273.15,
             units: "°C",
         }
     }
 
     pub fn from_voltage(min: u16, max: u16, current: u16) -> Self {
         Self {
-            min: ((min >> 4) as f32 * 3.0)/4096.0,
-            max: ((max >> 4) as f32 * 3.0)/4096.0,
-            current: ((current >> 4) as f32 * 3.0)/4096.0,
+            min: ((min >> 4) as f32 * 3.0) / 4096.0,
+            max: ((max >> 4) as f32 * 3.0) / 4096.0,
+            current: ((current >> 4) as f32 * 3.0) / 4096.0,
             units: "V",
         }
     }
@@ -380,12 +434,7 @@ impl fmt::Display for MinMaxNow {
         write!(
             f,
             "Min {:.2}{}, Max {:.2}{}, Now {:.2}{}",
-            self.min,
-            self.units,
-            self.max,
-            self.units,
-            self.current,
-            self.units,
+            self.min, self.units, self.max, self.units, self.current, self.units,
         )
     }
 }
@@ -441,12 +490,12 @@ impl fmt::Display for XadcReading {
 }
 
 fn vrefp_to_float(vrefp: u16) -> f32 {
-    ((vrefp >> 4) as f32) * 3.0/4096.0
+    ((vrefp >> 4) as f32) * 3.0 / 4096.0
 }
 
 fn vrefn_to_float(vrefn: u16) -> f32 {
     let vrefn = ((vrefn as i16) >> 4) as f32;
-    vrefn * 3.0/4096.0
+    vrefn * 3.0 / 4096.0
 }
 
 /// Configuration status register.
@@ -458,23 +507,57 @@ impl Status {
         Self(word)
     }
 
-    pub fn startup_state(&self) -> u8       { ((self.0 >> 18) & 0b111) as u8 }
-    pub fn xadc_overtemp(&self) -> bool     { self.bit(17) }
-    pub fn dec_error(&self) -> bool         { self.bit(16) }
-    pub fn id_error(&self) -> bool          { self.bit(15) }
-    pub fn done(&self) -> bool              { self.bit(14) }
-    pub fn release_done(&self) -> bool      { self.bit(13) }
-    pub fn init_b(&self) -> bool            { self.bit(12) }
-    pub fn init_complete(&self) -> bool     { self.bit(11) }
-    pub fn mode(&self) -> u8                { ((self.0 >> 8) & 0b111) as u8 }
-    pub fn ghigh_b(&self) -> bool           { self.bit(7) }
-    pub fn gwe(&self) -> bool               { self.bit(6) }
-    pub fn gts_cfg_b(&self) -> bool         { self.bit(5) }
-    pub fn eos(&self) -> bool               { self.bit(4) }
-    pub fn dci_match(&self) -> bool         { self.bit(3) }
-    pub fn mmcm_lock(&self) -> bool         { self.bit(2) }
-    pub fn part_secured(&self) -> bool      { self.bit(1) }
-    pub fn crc_error(&self) -> bool         { self.bit(0) }
+    pub fn startup_state(&self) -> u8 {
+        ((self.0 >> 18) & 0b111) as u8
+    }
+    pub fn xadc_overtemp(&self) -> bool {
+        self.bit(17)
+    }
+    pub fn dec_error(&self) -> bool {
+        self.bit(16)
+    }
+    pub fn id_error(&self) -> bool {
+        self.bit(15)
+    }
+    pub fn done(&self) -> bool {
+        self.bit(14)
+    }
+    pub fn release_done(&self) -> bool {
+        self.bit(13)
+    }
+    pub fn init_b(&self) -> bool {
+        self.bit(12)
+    }
+    pub fn init_complete(&self) -> bool {
+        self.bit(11)
+    }
+    pub fn mode(&self) -> u8 {
+        ((self.0 >> 8) & 0b111) as u8
+    }
+    pub fn ghigh_b(&self) -> bool {
+        self.bit(7)
+    }
+    pub fn gwe(&self) -> bool {
+        self.bit(6)
+    }
+    pub fn gts_cfg_b(&self) -> bool {
+        self.bit(5)
+    }
+    pub fn eos(&self) -> bool {
+        self.bit(4)
+    }
+    pub fn dci_match(&self) -> bool {
+        self.bit(3)
+    }
+    pub fn mmcm_lock(&self) -> bool {
+        self.bit(2)
+    }
+    pub fn part_secured(&self) -> bool {
+        self.bit(1)
+    }
+    pub fn crc_error(&self) -> bool {
+        self.bit(0)
+    }
 
     fn bit(&self, offset: usize) -> bool {
         (self.0 >> offset) & 1 == 1
@@ -502,63 +585,98 @@ impl fmt::Debug for Status {
   MMCM lock: {}
   Secured: {}
   CRC error: {}",
-            self.0, self.startup_state(), self.xadc_overtemp(), self.dec_error(), self.id_error(),
-            self.done(), self.release_done(), self.init_b(), self.init_complete(), self.mode(),
-            self.ghigh_b(), self.gwe(), self.gts_cfg_b(), self.eos(), self.dci_match(),
-            self.mmcm_lock(), self.part_secured(), self.crc_error()))
+            self.0,
+            self.startup_state(),
+            self.xadc_overtemp(),
+            self.dec_error(),
+            self.id_error(),
+            self.done(),
+            self.release_done(),
+            self.init_b(),
+            self.init_complete(),
+            self.mode(),
+            self.ghigh_b(),
+            self.gwe(),
+            self.gts_cfg_b(),
+            self.eos(),
+            self.dci_match(),
+            self.mmcm_lock(),
+            self.part_secured(),
+            self.crc_error()
+        ))
     }
 }
 
-pub struct X7 {
-    tap: JTAGTAP,
-    idcode: X7IDCODE,
+pub struct X7<'a> {
+    tap: &'a mut dyn JtagAccess,
+    idcode: X7IdCode,
 }
 
-impl X7 {
-    pub fn new(tap: JTAGTAP, idcode: X7IDCODE) -> Self {
+impl<'a> X7<'a> {
+    pub fn new(tap: &'a mut dyn JtagAccess, idcode: X7IdCode) -> Self {
         X7 { tap, idcode }
     }
 
-    pub fn idcode(&self) -> X7IDCODE {
+    pub fn idcode(&self) -> X7IdCode {
         self.idcode
+    }
+
+    /// Remain in Run-Test/Idle for `n` TCK cycles.
+    ///
+    /// `JtagAccess` has no idle-only primitive that is safe to use mid
+    /// register transaction (an XADC_DRP read relies on the addressed DR
+    /// being left alone between the command and the result shift), so this
+    /// drives TMS low directly instead of going through a DR/IR access.
+    fn idle(&mut self, n: usize) -> Result<()> {
+        self.tap.shift_raw_sequence(JtagSequence {
+            tdo_capture: false,
+            tms: false,
+            data: BitVec::repeat(false, n),
+        })?;
+        Ok(())
     }
 
     /// Read full 64-bit device DNA.
     pub fn dna(&mut self) -> Result<Vec<u8>> {
-        self.command(Command::FUSE_DNA)?;
-        let data = self.tap.read_dr(64)?;
-        let dna = bits_to_bytes(&data);
+        let dna = self.tap.read_register(Command::FuseDna as u32, 64)?;
+        let dna = dna.load_le::<u64>().to_le_bytes().to_vec();
         log::info!("Read DNA: {:02X?}", dna);
         Ok(dna)
     }
 
     /// Read STATUS register content.
     pub fn status(&mut self) -> Result<Status> {
-        self.tap.test_logic_reset()?;
-        self.tap.run_test_idle(5)?;
-        self.command(Command::CFG_IN)?;
-        let mut bits = Vec::new();
-        bitvec::append_u32(&mut bits, 0xaa99_5566u32.reverse_bits());
-        bitvec::append_u32(&mut bits, 0x2000_0000u32.reverse_bits());
-        bitvec::append_u32(&mut bits, 0x2800_e001u32.reverse_bits());
-        bitvec::append_u32(&mut bits, 0x2000_0000u32.reverse_bits());
-        bitvec::append_u32(&mut bits, 0x2000_0000u32.reverse_bits());
-        self.tap.write_dr(&bits)?;
-        self.command(Command::CFG_OUT)?;
-        let status = bits_to_bytes(&self.tap.read_dr(32)?);
-        let status = u32::from_le_bytes([status[0], status[1], status[2], status[3]]);
-        let status = Status::new(status.reverse_bits());
+        self.tap.tap_reset()?;
+        self.idle(5)?;
+
+        let mut cfg = Vec::new();
+        for word in [
+            0xaa99_5566u32,
+            0x2000_0000,
+            0x2800_e001,
+            0x2000_0000,
+            0x2000_0000,
+        ] {
+            cfg.extend_from_slice(&word.reverse_bits().to_le_bytes());
+        }
+        self.tap
+            .write_register(Command::CfgIn as u32, &cfg, cfg.len() as u32 * 8)?;
+
+        let status = self.tap.read_register(Command::CfgOut as u32, 32)?;
+        let status = Status::new(status.load_le::<u32>().reverse_bits());
         log::debug!("{:?}", status);
-        self.tap.test_logic_reset()?;
+        self.tap.tap_reset()?;
         Ok(status)
     }
 
     /// Read XADC registers
     pub fn xadc(&mut self) -> Result<XadcReading> {
-        // Select XADC mode
-        self.tap.test_logic_reset()?;
-        self.tap.run_test_idle(5)?;
-        self.command(Command::XADC_DRP)?;
+        // Select XADC mode. The DR content of this first shift is discarded,
+        // same as the leading shift of every read_xadc_reg call below.
+        self.tap.tap_reset()?;
+        self.idle(5)?;
+        self.tap
+            .write_register(Command::XadcDrp as u32, &[0; 4], 32)?;
 
         let reading = XadcReading {
             temperature: MinMaxNow::from_temperature(
@@ -602,19 +720,18 @@ impl X7 {
             is_zynq7000: self.idcode.is_zynq7000(),
         };
 
-        self.tap.test_logic_reset()?;
+        self.tap.tap_reset()?;
         Ok(reading)
     }
 
     /// Read single XADC register
     fn read_xadc_reg(&mut self, reg: XadcReg) -> Result<u16> {
         log::debug!("Reading XADC register {:?} ({:04X})", reg, reg as u16);
-        let mut bits = Vec::new();
-        bitvec::append_u32(&mut bits, 0x0400_0000 | ((reg as u32) << 16));
-        self.tap.write_dr(&bits)?;
-        self.tap.run_test_idle(15)?;
-        let result = bits_to_bytes(&self.tap.read_dr(32)?);
-        let result = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
+        let word = 0x0400_0000 | ((reg as u32) << 16);
+        self.tap.write_dr(&word.to_le_bytes(), 32)?;
+        self.idle(15)?;
+        let result = self.tap.write_dr(&[0; 4], 32)?;
+        let result = result.load_le::<u32>();
         log::debug!("Got result {:08X}", result);
         Ok(result as u16)
     }
@@ -623,7 +740,7 @@ impl X7 {
     ///
     /// The FPGA is reset and begins running the new bitstream after programming.
     pub fn program(&mut self, data: &[u8]) -> Result<()> {
-        self.program_cb(data, |_| {})
+        self.program_with_callback(data, |_| {})
     }
 
     /// Program a bitstream to SRAM, with a progress bar.
@@ -638,15 +755,17 @@ impl X7 {
         let pb = ProgressBar::new(data.len() as u64).with_style(
             ProgressStyle::with_template(DATA_PROGRESS_TPL)
                 .unwrap()
-                .progress_chars(DATA_PROGRESS_CHARS));
+                .progress_chars(DATA_PROGRESS_CHARS),
+        );
         pb.set_message("Programming");
         pb.set_position(0);
 
-        self.program_cb(data, |n| pb.set_position(n as u64))?;
+        self.program_with_callback(data, |n| pb.set_position(n as u64))?;
 
-        pb.set_style(ProgressStyle::with_template(DATA_FINISHED_TPL)
-            .unwrap()
-            .progress_chars(DATA_PROGRESS_CHARS)
+        pb.set_style(
+            ProgressStyle::with_template(DATA_FINISHED_TPL)
+                .unwrap()
+                .progress_chars(DATA_PROGRESS_CHARS),
         );
 
         pb.finish();
@@ -656,46 +775,61 @@ impl X7 {
     /// Program a bitstream to SRAM, calling `cb` with the number of bytes programmed so far.
     ///
     /// The FPGA is reset and begins running the new bitstream after programming.
-    pub fn program_cb<F: Fn(usize)>(&mut self, data: &[u8], cb: F) -> Result<()> {
-        // Reset FPGA and wait 10ms.
+    /// See UG470 p.166 Table 10-4 for more information.
+    pub fn program_with_callback<F: Fn(usize)>(&mut self, data: &[u8], cb: F) -> Result<()> {
         self.check_ready_to_program()?;
-        self.tap.test_logic_reset()?;
-        self.command(Command::JPROGRAM)?;
-        self.tap.run_test_idle(1)?;
+        self.tap.tap_reset()?;
+        self.tap.write_register(Command::JProgram as u32, &[], 0)?;
+        self.tap.tap_reset()?;
         std::thread::sleep(Duration::from_millis(20));
 
-        // Enter configuration mode.
-        self.tap.test_logic_reset()?;
-        self.command(Command::CFG_IN)?;
-
-        // Load in entire bitstream.
-        // We need to send the MSb of the first byte first and finish on the LSb of the last byte,
-        // so since bytes_to_bits is LSb-first, we reverse the bit order of each byte.
+        // Xilinx bitstream bytes are MSb first, but a JTAG DR shift is LSb
+        // first per byte, so each byte's bit order needs reversing before
+        // it goes on the wire.
         let data: Vec<u8> = data.iter().map(|x| x.reverse_bits()).collect();
-        let bits = bytes_to_bits(&data, data.len() * 8)?;
 
-        // Write bitstream, passing the callback through.
-        self.tap.write_dr_cb(&bits, |n| cb(n / 8))?;
+        // Select CFG_IN (IR only, no DR touch), then hold Shift-DR open
+        // continuously across the entire bitstream via write_dr_partial,
+        // chunked only for the FTDI command buffer's sake (see idle()'s
+        // comment), exiting only once at the very end. Xilinx's config
+        // engine needs one continuous DR shift for the whole bitstream:
+        // exiting to Update-DR between chunks leaves the device sitting
+        // unconfigured with no error flags at all, as if the data never
+        // reached the frame parser past a chunk boundary. Matches
+        // openFPGALoader's own CFG_IN loading, which holds Shift-DR open
+        // the same way.
+        self.tap.write_register(Command::CfgIn as u32, &[], 0)?;
+
+        const CHUNK_BYTES: usize = 8192;
+        let mut chunks = data.chunks(CHUNK_BYTES).peekable();
+        let mut written = 0;
+        while let Some(chunk) = chunks.next() {
+            let last = chunks.peek().is_none();
+            self.tap
+                .write_dr_partial(chunk, chunk.len() as u32 * 8, written == 0, last)?;
+            written += chunk.len();
+            cb(written);
+        }
 
         // Return to Run-Test/Idle to complete programming.
-        self.tap.run_test_idle(1)?;
+        self.idle(1)?;
 
         // Begin startup sequence.
-        self.command(Command::JSTART)?;
-        self.tap.run_test_idle(2000)?;
-        self.tap.test_logic_reset()?;
+        self.tap.write_register(Command::JStart as u32, &[], 0)?;
+        self.idle(2000)?;
+        self.tap.tap_reset()?;
 
         // Check programming was OK.
         self.check_programmed_ok()?;
-        self.tap.test_logic_reset()?;
+        self.tap.tap_reset()?;
 
         Ok(())
     }
 
     pub fn jprogram(&mut self) -> Result<()> {
-        self.command(Command::JPROGRAM)?;
-        self.tap.run_test_idle(2000)?;
-        self.tap.test_logic_reset()?;
+        self.tap.write_register(Command::JProgram as u32, &[], 0)?;
+        self.idle(2000)?;
+        self.tap.tap_reset()?;
         Ok(())
     }
 
@@ -745,12 +879,6 @@ impl X7 {
             return Err(Error::BadStatus);
         }
         Ok(())
-    }
-
-    /// Load a command into the IR.
-    fn command(&mut self, command: Command) -> Result<()> {
-        log::trace!("Loading command {:?}", command);
-        Ok(self.tap.write_ir(&command.bits())?)
     }
 }
 
